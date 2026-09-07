@@ -18,16 +18,38 @@ class Tool:
     name: str
     description: str
     input_schema: dict[str, Any]
-    func: Callable[..., pd.DataFrame]
+    func: Callable[..., Any]
+    needs_df: bool = True
+    returns_df: bool = False
 
 
 _REGISTRY: dict[str, Tool] = {}
 
 
-def register_tool(name: str, description: str, input_schema: dict[str, Any], func: Callable) -> None:
+def register_tool(
+    name: str,
+    description: str,
+    input_schema: dict[str, Any],
+    func: Callable,
+    needs_df: bool = True,
+    returns_df: bool = False,
+) -> None:
     if name in _REGISTRY:
         raise ValueError(f"Tool already registered: {name!r}")
-    _REGISTRY[name] = Tool(name=name, description=description, input_schema=input_schema, func=func)
+    _REGISTRY[name] = Tool(
+        name=name,
+        description=description,
+        input_schema=input_schema,
+        func=func,
+        needs_df=needs_df,
+        returns_df=returns_df,
+    )
+
+
+def get_tool(name: str) -> Tool:
+    if name not in _REGISTRY:
+        raise KeyError(f"Unknown tool: {name!r}. Available: {sorted(_REGISTRY)}")
+    return _REGISTRY[name]
 
 
 def get_tool_schemas() -> list[dict[str, Any]]:
@@ -38,7 +60,10 @@ def get_tool_schemas() -> list[dict[str, Any]]:
     ]
 
 
-def execute_tool(name: str, df: pd.DataFrame, **kwargs) -> Any:
-    if name not in _REGISTRY:
-        raise KeyError(f"Unknown tool: {name!r}. Available: {sorted(_REGISTRY)}")
-    return _REGISTRY[name].func(df, **kwargs)
+def execute_tool(name: str, df: pd.DataFrame | None = None, **kwargs) -> Any:
+    tool = get_tool(name)
+    if tool.needs_df:
+        if df is None:
+            raise ValueError(f"Tool {name!r} requires a DataFrame but none was provided.")
+        return tool.func(df, **kwargs)
+    return tool.func(**kwargs)
