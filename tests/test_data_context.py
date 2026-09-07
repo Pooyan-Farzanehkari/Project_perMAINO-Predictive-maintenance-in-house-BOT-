@@ -73,6 +73,7 @@ def test_extract_file_text_missing_file_raises(tmp_path):
         extract_file_text(str(tmp_path / "nope.txt"))
 
 
+@pytest.mark.skipif(not REAL_PDF.exists(), reason="dataset not present locally (gitignored, download separately)")
 def test_extract_file_text_real_pdf():
     text = extract_file_text(str(REAL_PDF))
 
