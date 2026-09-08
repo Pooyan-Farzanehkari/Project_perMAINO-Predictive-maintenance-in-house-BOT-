@@ -22,11 +22,22 @@ DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5")
 DEFAULT_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "medium")
 MAX_TOKENS = 4096
 MAX_TOOL_ITERATIONS = 8
-MAX_FABRICATION_RETRIES = 1
+MAX_UNRELIABLE_RETRIES = 2
 
-# Markers seen when the model writes a fake tool call/result as plain text instead of
-# using the real tool-calling mechanism -- catch and correct this rather than trust it.
+# Two distinct unreliable-reply patterns seen in testing, both treated the same way:
+# (1) the model writes a fake tool call/result as plain text instead of using the real
+#     tool-calling mechanism, and (2) the model falsely claims no tool interface is
+#     available and refuses to call anything -- catch either rather than trust it.
 _FABRICATION_MARKERS = ("invoke", "function_calls", "function_results")
+_FALSE_REFUSAL_MARKERS = (
+    "no tool-calling interface",
+    "not wired up",
+    "no callable function",
+    "cannot call any tool",
+    "can't call any tool",
+    "don't have access to any tool",
+    "no tool interface",
+)
 
 SYSTEM_PROMPT = """You are a data preprocessing assistant for a predictive-maintenance \
 project. You help an engineer clean and prepare sensor time-series data (currently the \
@@ -84,7 +95,7 @@ class AgentSession:
 
     def run_turn(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
-        fabrication_retries = 0
+        unreliable_retries = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
             response = self.client.messages.create(
@@ -100,28 +111,28 @@ class AgentSession:
             if response.stop_reason != "tool_use":
                 text = "".join(b.text for b in response.content if b.type == "text")
 
-                if self._looks_fabricated(text):
+                if self._looks_unreliable(text):
                     log_tool_call(
-                        "_fabrication_detected",
-                        {"attempt": fabrication_retries},
+                        "_unreliable_reply_detected",
+                        {"attempt": unreliable_retries},
                         text[:2000],
                         is_error=True,
                         path=self.audit_log_path,
                     )
-                    if fabrication_retries >= MAX_FABRICATION_RETRIES:
+                    if unreliable_retries >= MAX_UNRELIABLE_RETRIES:
                         return (
-                            "[warning: the model wrote what looks like a simulated tool "
-                            "call instead of a real one, even after a retry -- treat this "
-                            f"as unverified, not real tool output]\n\n{text}"
+                            "[warning: could not get a reliable reply this turn after "
+                            f"{MAX_UNRELIABLE_RETRIES} retries -- please try rephrasing as "
+                            "a single, simple step, e.g. \"call get_data_context\"]"
                         )
-                    fabrication_retries += 1
+                    unreliable_retries += 1
                     self.messages.append(
                         {
                             "role": "user",
                             "content": (
-                                "That was not a real tool call -- you wrote tool-call or "
-                                "tool-result syntax as plain text instead of using the "
-                                "actual tool-calling mechanism. Make one real tool call now."
+                                "Tools are available and working correctly in this "
+                                "conversation -- there is no problem with the tool-calling "
+                                "mechanism. Call one real tool now, exactly as instructed."
                             ),
                         }
                     )
@@ -134,14 +145,31 @@ class AgentSession:
                 for block in response.content
                 if block.type == "tool_use"
             ]
+
+            if not tool_results:
+                # stop_reason was "tool_use" but no real tool_use block was found --
+                # the API rejects an empty tool-results message, and looping again with
+                # nothing new would likely just repeat. Surface this rather than crash.
+                log_tool_call(
+                    "_empty_tool_use_response",
+                    {},
+                    "stop_reason was tool_use but response.content had no tool_use block",
+                    is_error=True,
+                    path=self.audit_log_path,
+                )
+                return (
+                    "[warning: the model signaled a tool call but didn't actually specify "
+                    "one -- please rephrase your request]"
+                )
+
             self.messages.append({"role": "user", "content": tool_results})
 
         return "Reached the tool-call limit for this turn -- please rephrase or continue."
 
     @staticmethod
-    def _looks_fabricated(text: str) -> bool:
+    def _looks_unreliable(text: str) -> bool:
         lowered = text.lower()
-        return any(marker in lowered for marker in _FABRICATION_MARKERS)
+        return any(marker in lowered for marker in _FABRICATION_MARKERS + _FALSE_REFUSAL_MARKERS)
 
     def _execute_tool_block(self, block) -> dict:
         try:

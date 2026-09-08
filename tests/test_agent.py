@@ -118,18 +118,35 @@ def test_run_turn_retries_once_on_fabricated_tool_call(tmp_path):
     assert len(client.messages.create_calls) == 2
     retry_message = client.messages.create_calls[1]["messages"][-1]
     assert retry_message["role"] == "user"
-    assert "not a real tool call" in retry_message["content"]
+    assert "working correctly" in retry_message["content"]
 
     entries = read_audit_log(path=audit_path)
     assert len(entries) == 1
-    assert entries[0]["tool"] == "_fabrication_detected"
+    assert entries[0]["tool"] == "_unreliable_reply_detected"
     assert entries[0]["is_error"] is True
 
 
-def test_run_turn_warns_after_repeated_fabrication(tmp_path):
+def test_run_turn_detects_false_refusal_claim(tmp_path):
+    refusal_text = "I don't have a tool-calling interface -- it's not wired up on my end."
+    refusal = _response([_text(refusal_text)], "end_turn")
+    clean = _response([_text("Got it, calling now.")], "end_turn")
+    client = FakeClient([refusal, clean])
+
+    df = pd.DataFrame({"a": [1.0]})
+    audit_path = tmp_path / "audit.jsonl"
+    session = AgentSession(df=df, client=client, audit_log_path=audit_path)
+    reply = session.run_turn("check the data context")
+
+    assert reply == "Got it, calling now."
+    entries = read_audit_log(path=audit_path)
+    assert len(entries) == 1
+    assert entries[0]["tool"] == "_unreliable_reply_detected"
+
+
+def test_run_turn_suppresses_content_after_repeated_unreliable_replies(tmp_path):
     fabricated_text = 'antml:invoke name="profile_dataset"></invoke>'
     fabricated = _response([_text(fabricated_text)], "end_turn")
-    client = FakeClient([fabricated, fabricated])
+    client = FakeClient([fabricated, fabricated, fabricated])
 
     df = pd.DataFrame({"a": [1.0]})
     audit_path = tmp_path / "audit.jsonl"
@@ -137,12 +154,12 @@ def test_run_turn_warns_after_repeated_fabrication(tmp_path):
     reply = session.run_turn("profile it")
 
     assert reply.startswith("[warning:")
-    assert fabricated_text in reply
-    assert len(client.messages.create_calls) == 2
+    assert fabricated_text not in reply
+    assert len(client.messages.create_calls) == 3
 
     entries = read_audit_log(path=audit_path)
-    assert len(entries) == 2
-    assert all(e["tool"] == "_fabrication_detected" for e in entries)
+    assert len(entries) == 3
+    assert all(e["tool"] == "_unreliable_reply_detected" for e in entries)
 
 
 def test_run_turn_hits_iteration_cap(tmp_path):
