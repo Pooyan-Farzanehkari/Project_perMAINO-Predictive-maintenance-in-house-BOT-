@@ -96,6 +96,10 @@ class AgentSession:
     def run_turn(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
         unreliable_retries = 0
+        # What actually gets sent to the API this attempt. Kept in sync with
+        # self.messages except during an unreliable-reply retry, where it carries a
+        # transient nudge that is never committed -- see the note below on why.
+        working_messages = list(self.messages)
 
         for _ in range(MAX_TOOL_ITERATIONS):
             response = self.client.messages.create(
@@ -104,9 +108,8 @@ class AgentSession:
                 system=SYSTEM_PROMPT,
                 tools=get_tool_schemas(),
                 output_config={"effort": self.effort},
-                messages=self.messages,
+                messages=working_messages,
             )
-            self.messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason != "tool_use":
                 text = "".join(b.text for b in response.content if b.type == "text")
@@ -120,13 +123,18 @@ class AgentSession:
                         path=self.audit_log_path,
                     )
                     if unreliable_retries >= MAX_UNRELIABLE_RETRIES:
+                        # self.messages is untouched -- none of the failed attempts or
+                        # corrective nudges persist into future turns. A polluted
+                        # history of "you got this wrong" exchanges is itself what
+                        # seemed to push the model toward doubting its own tools in
+                        # later turns, so a suppressed turn must leave no trace.
                         return (
                             "[warning: could not get a reliable reply this turn after "
                             f"{MAX_UNRELIABLE_RETRIES} retries -- please try rephrasing as "
                             "a single, simple step, e.g. \"call get_data_context\"]"
                         )
                     unreliable_retries += 1
-                    self.messages.append(
+                    working_messages = list(self.messages) + [
                         {
                             "role": "user",
                             "content": (
@@ -135,10 +143,16 @@ class AgentSession:
                                 "mechanism. Call one real tool now, exactly as instructed."
                             ),
                         }
-                    )
+                    ]
                     continue
 
+                # A clean, reliable final answer -- this is worth keeping in history.
+                self.messages.append({"role": "assistant", "content": response.content})
                 return text
+
+            # Real tool_use: commit the assistant turn and its results for real, they're
+            # genuine grounding for future turns, not noise.
+            self.messages.append({"role": "assistant", "content": response.content})
 
             tool_results = [
                 self._execute_tool_block(block)
@@ -163,6 +177,7 @@ class AgentSession:
                 )
 
             self.messages.append({"role": "user", "content": tool_results})
+            working_messages = list(self.messages)
 
         return "Reached the tool-call limit for this turn -- please rephrase or continue."
 

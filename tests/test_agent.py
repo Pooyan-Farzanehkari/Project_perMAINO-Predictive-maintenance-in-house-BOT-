@@ -125,6 +125,13 @@ def test_run_turn_retries_once_on_fabricated_tool_call(tmp_path):
     assert entries[0]["tool"] == "_unreliable_reply_detected"
     assert entries[0]["is_error"] is True
 
+    # The failed attempt and the corrective nudge must never persist into history --
+    # only the original question and the eventual clean answer.
+    assert session.messages == [
+        {"role": "user", "content": "check the data context"},
+        {"role": "assistant", "content": clean.content},
+    ]
+
 
 def test_run_turn_detects_false_refusal_claim(tmp_path):
     refusal_text = "I don't have a tool-calling interface -- it's not wired up on my end."
@@ -141,6 +148,10 @@ def test_run_turn_detects_false_refusal_claim(tmp_path):
     entries = read_audit_log(path=audit_path)
     assert len(entries) == 1
     assert entries[0]["tool"] == "_unreliable_reply_detected"
+    assert session.messages == [
+        {"role": "user", "content": "check the data context"},
+        {"role": "assistant", "content": clean.content},
+    ]
 
 
 def test_run_turn_suppresses_content_after_repeated_unreliable_replies(tmp_path):
@@ -160,6 +171,49 @@ def test_run_turn_suppresses_content_after_repeated_unreliable_replies(tmp_path)
     entries = read_audit_log(path=audit_path)
     assert len(entries) == 3
     assert all(e["tool"] == "_unreliable_reply_detected" for e in entries)
+
+    # Fully suppressed: nothing from the 3 failed attempts should persist, only the
+    # engineer's original question -- next turn starts from a clean slate.
+    assert session.messages == [{"role": "user", "content": "profile it"}]
+
+
+def test_unreliable_retry_within_a_turn_does_not_pollute_the_next_turn(tmp_path):
+    fabricated = _response(
+        [_text('antml:invoke name="profile_dataset"></invoke>')], "end_turn"
+    )
+    tool_use_response = _response([_tool_use("toolu_1", "profile_dataset", {})], "tool_use")
+    turn1_final = _response([_text("Here is the profile.")], "end_turn")
+    turn2_final = _response([_text("Sure, doing that now.")], "end_turn")
+    client = FakeClient([fabricated, tool_use_response, turn1_final, turn2_final])
+
+    df = pd.DataFrame({"a": [1.0]})
+    audit_path = tmp_path / "audit.jsonl"
+    session = AgentSession(df=df, client=client, audit_log_path=audit_path)
+
+    reply1 = session.run_turn("profile it")
+    assert reply1 == "Here is the profile."
+
+    reply2 = session.run_turn("now clean it up")
+    assert reply2 == "Sure, doing that now."
+
+    sent_for_turn2 = client.messages.create_calls[-1]["messages"]
+    flattened = json.dumps(sent_for_turn2, default=str)
+    assert "antml:invoke" not in flattened
+    assert "working correctly" not in flattened
+
+
+def test_run_turn_handles_tool_use_stop_reason_with_no_tool_use_block(tmp_path):
+    # A real (if malformed) response: stop_reason says tool_use but content has none.
+    # This previously crashed by sending the API an empty tool-results message.
+    malformed = _response([_text("I'll call a tool.")], "tool_use")
+    client = FakeClient([malformed])
+
+    df = pd.DataFrame({"a": [1.0]})
+    session = AgentSession(df=df, client=client, audit_log_path=tmp_path / "audit.jsonl")
+    reply = session.run_turn("do something")
+
+    assert reply.startswith("[warning:")
+    assert "didn't actually specify" in reply
 
 
 def test_run_turn_hits_iteration_cap(tmp_path):
