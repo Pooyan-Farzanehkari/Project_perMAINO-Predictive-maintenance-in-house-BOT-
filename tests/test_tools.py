@@ -14,14 +14,18 @@ MUTATING_TOOLS = {
 }
 
 
+NON_MUTATING_TOOLS = [
+    "profile_dataset",
+    "read_description_file",
+    "record_data_context",
+    "get_data_context",
+    "get_tool_call_log",
+]
+
+
 def test_all_expected_tools_registered():
     names = {s["name"] for s in get_tool_schemas()}
-    assert names == MUTATING_TOOLS | {
-        "profile_dataset",
-        "read_description_file",
-        "record_data_context",
-        "get_data_context",
-    }
+    assert names == MUTATING_TOOLS | set(NON_MUTATING_TOOLS)
 
 
 def test_mutating_tools_flagged_returns_df():
@@ -30,12 +34,12 @@ def test_mutating_tools_flagged_returns_df():
 
 
 def test_non_mutating_tools_not_flagged_returns_df():
-    for name in ["profile_dataset", "read_description_file", "record_data_context", "get_data_context"]:
+    for name in NON_MUTATING_TOOLS:
         assert get_tool(name).returns_df is False
 
 
 def test_intake_tools_flagged_needs_df_false():
-    for name in ["read_description_file", "record_data_context", "get_data_context"]:
+    for name in ["read_description_file", "record_data_context", "get_data_context", "get_tool_call_log"]:
         assert get_tool(name).needs_df is False
 
 
@@ -56,6 +60,11 @@ def test_execute_tool_fill_missing():
     df = pd.DataFrame({"a": [1.0, None, 3.0]})
     result = execute_tool("fill_missing", df, strategy="mean", columns=["a"])
     assert result["a"].isna().sum() == 0
+
+
+def test_execute_tool_get_tool_call_log_returns_list():
+    result = execute_tool("get_tool_call_log")
+    assert isinstance(result, list)
 
 
 def test_execute_unknown_tool_raises():

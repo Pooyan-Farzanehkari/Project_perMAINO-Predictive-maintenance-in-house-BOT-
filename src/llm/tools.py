@@ -12,6 +12,7 @@ from src.cleaning.missing_values import (
     interpolate_missing,
 )
 from src.features.normalization import min_max_scale, robust_scale, z_score_scale
+from src.llm.audit_log import read_audit_log
 from src.llm.tool_registry import execute_tool, get_tool_schemas, register_tool
 from src.pipeline.data_context import extract_file_text, load_data_context, record_data_context
 from src.pipeline.profiling import profile_dataset
@@ -210,6 +211,28 @@ register_tool(
     ),
     input_schema={"type": "object", "properties": {}, "required": []},
     func=lambda: load_data_context() or {"status": "no_data_context_saved_yet"},
+    needs_df=False,
+)
+
+register_tool(
+    name="get_tool_call_log",
+    description=(
+        "Retrieve the most recent real tool calls and their real results, exactly as "
+        "they happened -- independent of anything said in the conversation. Use this if "
+        "the engineer asks you to double-check or justify a claim you made."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Number of most recent log entries to return.",
+                "default": 20,
+            }
+        },
+        "required": [],
+    },
+    func=lambda limit=20: read_audit_log()[-limit:],
     needs_df=False,
 )
 

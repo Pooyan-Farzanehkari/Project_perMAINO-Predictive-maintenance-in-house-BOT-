@@ -14,6 +14,7 @@ import anthropic
 import pandas as pd
 from dotenv import load_dotenv
 
+from src.llm.audit_log import AUDIT_LOG_PATH, log_tool_call
 from src.llm.tool_registry import execute_tool, get_tool, get_tool_schemas
 from src.pipeline.load_data import PROCESSED_PARQUET_PATH, load_raw_data
 
@@ -47,6 +48,8 @@ You have tools to:
 expected range, and notes, plus a short description of the asset the data comes from \
 (record_data_context, get_data_context) -- so this only has to be established once and \
 persists across sessions.
+- Look up the real, independently-logged record of recent tool calls and their real \
+results (get_tool_call_log) -- use this if the engineer asks you to justify a claim.
 
 At the start of a conversation, call get_data_context first. If no context is saved yet, \
 offer to read a description file (ask the engineer for its path if you don't know it) \
@@ -70,11 +73,13 @@ class AgentSession:
         client: anthropic.Anthropic | None = None,
         model: str = DEFAULT_MODEL,
         effort: str = DEFAULT_EFFORT,
+        audit_log_path=AUDIT_LOG_PATH,
     ):
         self.df = df
         self.client = client or anthropic.Anthropic()
         self.model = model
         self.effort = effort
+        self.audit_log_path = audit_log_path
         self.messages: list[dict] = []
 
     def run_turn(self, user_text: str) -> str:
@@ -96,6 +101,13 @@ class AgentSession:
                 text = "".join(b.text for b in response.content if b.type == "text")
 
                 if self._looks_fabricated(text):
+                    log_tool_call(
+                        "_fabrication_detected",
+                        {"attempt": fabrication_retries},
+                        text[:2000],
+                        is_error=True,
+                        path=self.audit_log_path,
+                    )
                     if fabrication_retries >= MAX_FABRICATION_RETRIES:
                         return (
                             "[warning: the model wrote what looks like a simulated tool "
@@ -136,6 +148,7 @@ class AgentSession:
             tool = get_tool(block.name)
             result = execute_tool(block.name, df=self.df, **block.input)
         except Exception as exc:
+            log_tool_call(block.name, block.input, str(exc), is_error=True, path=self.audit_log_path)
             return {
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -146,8 +159,10 @@ class AgentSession:
         if tool.returns_df:
             self.df = result
             content = f"Applied. New shape: {result.shape[0]} rows x {result.shape[1]} columns."
+            log_tool_call(block.name, block.input, {"new_shape": list(result.shape)}, path=self.audit_log_path)
         else:
             content = json.dumps(result, default=str)
+            log_tool_call(block.name, block.input, result, path=self.audit_log_path)
 
         return {"type": "tool_result", "tool_use_id": block.id, "content": content}
 
