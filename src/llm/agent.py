@@ -18,12 +18,24 @@ from src.llm.tool_registry import execute_tool, get_tool, get_tool_schemas
 from src.pipeline.load_data import PROCESSED_PARQUET_PATH, load_raw_data
 
 DEFAULT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5")
-MAX_TOKENS = 16000
+DEFAULT_EFFORT = os.environ.get("ANTHROPIC_EFFORT", "medium")
+MAX_TOKENS = 4096
 MAX_TOOL_ITERATIONS = 8
+MAX_FABRICATION_RETRIES = 1
+
+# Markers seen when the model writes a fake tool call/result as plain text instead of
+# using the real tool-calling mechanism -- catch and correct this rather than trust it.
+_FABRICATION_MARKERS = ("invoke", "function_calls", "function_results")
 
 SYSTEM_PROMPT = """You are a data preprocessing assistant for a predictive-maintenance \
 project. You help an engineer clean and prepare sensor time-series data (currently the \
 MetroPT-3 air-compressor dataset) before it is used for modeling.
+
+Use the real, native tool-calling mechanism the API gives you for every one of these \
+actions. Do not describe, simulate, or write out a tool call or its result yourself in \
+your response text -- only state facts (row counts, missing-value counts, column stats) \
+that came from an actual tool result you just received, even for a dataset you recognize. \
+Make one tool call, wait for its real result, then decide the next step.
 
 You have tools to:
 - Inspect the dataset (profile_dataset) without ever seeing raw rows.
@@ -57,14 +69,17 @@ class AgentSession:
         df: pd.DataFrame,
         client: anthropic.Anthropic | None = None,
         model: str = DEFAULT_MODEL,
+        effort: str = DEFAULT_EFFORT,
     ):
         self.df = df
         self.client = client or anthropic.Anthropic()
         self.model = model
+        self.effort = effort
         self.messages: list[dict] = []
 
     def run_turn(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
+        fabrication_retries = 0
 
         for _ in range(MAX_TOOL_ITERATIONS):
             response = self.client.messages.create(
@@ -72,13 +87,35 @@ class AgentSession:
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
                 tools=get_tool_schemas(),
-                output_config={"effort": "medium"},
+                output_config={"effort": self.effort},
                 messages=self.messages,
             )
             self.messages.append({"role": "assistant", "content": response.content})
 
             if response.stop_reason != "tool_use":
-                return "".join(b.text for b in response.content if b.type == "text")
+                text = "".join(b.text for b in response.content if b.type == "text")
+
+                if self._looks_fabricated(text):
+                    if fabrication_retries >= MAX_FABRICATION_RETRIES:
+                        return (
+                            "[warning: the model wrote what looks like a simulated tool "
+                            "call instead of a real one, even after a retry -- treat this "
+                            f"as unverified, not real tool output]\n\n{text}"
+                        )
+                    fabrication_retries += 1
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "That was not a real tool call -- you wrote tool-call or "
+                                "tool-result syntax as plain text instead of using the "
+                                "actual tool-calling mechanism. Make one real tool call now."
+                            ),
+                        }
+                    )
+                    continue
+
+                return text
 
             tool_results = [
                 self._execute_tool_block(block)
@@ -88,6 +125,11 @@ class AgentSession:
             self.messages.append({"role": "user", "content": tool_results})
 
         return "Reached the tool-call limit for this turn -- please rephrase or continue."
+
+    @staticmethod
+    def _looks_fabricated(text: str) -> bool:
+        lowered = text.lower()
+        return any(marker in lowered for marker in _FABRICATION_MARKERS)
 
     def _execute_tool_block(self, block) -> dict:
         try:

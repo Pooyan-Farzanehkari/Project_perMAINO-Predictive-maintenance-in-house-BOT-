@@ -95,6 +95,38 @@ def test_run_turn_unknown_tool_reported_as_is_error():
     assert sent_result["is_error"] is True
 
 
+def test_run_turn_retries_once_on_fabricated_tool_call():
+    fabricated = _response(
+        [_text('I\'ll check now.\n\nantml:invoke name="get_data_context">\n</invoke>')], "end_turn"
+    )
+    clean = _response([_text("No context is saved yet.")], "end_turn")
+    client = FakeClient([fabricated, clean])
+
+    df = pd.DataFrame({"a": [1.0]})
+    session = AgentSession(df=df, client=client)
+    reply = session.run_turn("check the data context")
+
+    assert reply == "No context is saved yet."
+    assert len(client.messages.create_calls) == 2
+    retry_message = client.messages.create_calls[1]["messages"][-1]
+    assert retry_message["role"] == "user"
+    assert "not a real tool call" in retry_message["content"]
+
+
+def test_run_turn_warns_after_repeated_fabrication():
+    fabricated_text = 'antml:invoke name="profile_dataset"></invoke>'
+    fabricated = _response([_text(fabricated_text)], "end_turn")
+    client = FakeClient([fabricated, fabricated])
+
+    df = pd.DataFrame({"a": [1.0]})
+    session = AgentSession(df=df, client=client)
+    reply = session.run_turn("profile it")
+
+    assert reply.startswith("[warning:")
+    assert fabricated_text in reply
+    assert len(client.messages.create_calls) == 2
+
+
 def test_run_turn_hits_iteration_cap():
     responses = [_response([_tool_use(f"t{i}", "profile_dataset", {})], "tool_use") for i in range(20)]
     client = FakeClient(responses)
